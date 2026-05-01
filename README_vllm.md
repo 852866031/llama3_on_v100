@@ -13,6 +13,20 @@ GPUs, and runs a simple throughput benchmark.
 > step-by-step sections that follow exist to *build* that file — and to explain why
 > each version is pinned the way it is.
 
+> **⚠️ Workspace variable — set this once at the start of every shell session.**
+> Every command below uses `$WORKDIR` to refer to *your* scratch directory under
+> `/mnt/nobackup/`. Pick a name (typically your username) and create it:
+>
+> ```bash
+> export WORKDIR=/mnt/nobackup/$USER     # default: matches your login username
+> # or set a custom subdir, e.g.:
+> # export WORKDIR=/mnt/nobackup/myproject
+> mkdir -p $WORKDIR
+> ```
+>
+> If you log out and back in, **re-export `$WORKDIR`** before running any command in
+> this guide. (You can also add the `export` line to `~/.bashrc` to make it persistent.)
+
 ---
 
 ## 0. V100 Constraints (read first)

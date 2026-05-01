@@ -158,10 +158,16 @@ nuke and reconfigure: `rm -rf build && cmake -B build ...`.
 
 ---
 
-## 4. Convert the existing safetensors → GGUF, then quantize
+## 4. Convert the existing safetensors → FP16 GGUF
 
 The HF model is already at `/mnt/nobackup/jchen/hf_cache/hub/models--meta-llama--Meta-Llama-3-8B-Instruct/`.
-We'll convert it to FP16 GGUF and then quantize to Q4_K_M.
+We'll convert it to **FP16 GGUF** — the same numeric precision vLLM ends up using on
+V100 (since V100 has no native BF16, both stacks effectively run the model in FP16).
+**No quantization** — that would change the weights; we want to run the original model.
+
+> *(If you only have a 16 GB V100, the FP16 file (~16 GB) won't fit alongside KV
+> cache. In that case you'd quantize to Q5_K_M / Q4_K_M with `llama-quantize` — see
+> the troubleshooting note. On a 32 GB V100 you don't need to.)*
 
 ### 4a. Install the converter's Python deps
 
@@ -170,7 +176,7 @@ python -m pip install -r ~/llama3_on_v100/llama.cpp/requirements.txt
 ```
 
 This pulls `torch`, `transformers`, `numpy`, `sentencepiece`, `gguf`, etc. into the
-`llamacpp-v100` env (not the `vllm-v100` env — they're isolated).
+`llamacpp-v100` env (isolated from `vllm-v100`).
 
 ### 4b. Convert BF16 safetensors → FP16 GGUF
 
@@ -188,29 +194,9 @@ python ~/llama3_on_v100/llama.cpp/convert_hf_to_gguf.py "$SNAPSHOT" \
 
 Output is ~16 GB. Takes a few minutes — mostly disk-bound.
 
-### 4c. Quantize FP16 → Q4_K_M
-
-```bash
-~/llama3_on_v100/llama.cpp/build/bin/llama-quantize \
-    /mnt/nobackup/jchen/llama3_models/Meta-Llama-3-8B-Instruct-f16.gguf \
-    /mnt/nobackup/jchen/llama3_models/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf \
-    Q4_K_M
-```
-
-Output is ~4.7 GB. Quantization picker:
-
-| Type | Size | Notes |
-|---|---|---|
-| `Q4_K_M` | ~4.7 GB | sweet spot for 16 GB V100, plenty of context headroom |
-| `Q5_K_M` | ~5.7 GB | slightly higher quality |
-| `Q8_0` | ~8.5 GB | near-FP16 quality, fits 32 GB V100 with headroom |
-| (keep `f16`) | ~16 GB | requires 32 GB V100 |
-
-You can keep the `f16` file or delete it once you've quantized:
-
 ```bash
 ls -lh /mnt/nobackup/jchen/llama3_models/
-# rm /mnt/nobackup/jchen/llama3_models/Meta-Llama-3-8B-Instruct-f16.gguf   # optional
+# expect Meta-Llama-3-8B-Instruct-f16.gguf, ~15-16 GB
 ```
 
 ---
@@ -221,7 +207,7 @@ ls -lh /mnt/nobackup/jchen/llama3_models/
 cd ~/llama3_on_v100/llama.cpp
 
 ./build/bin/llama-cli \
-    -m /mnt/nobackup/jchen/llama3_models/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf \
+    -m /mnt/nobackup/jchen/llama3_models/Meta-Llama-3-8B-Instruct-f16.gguf \
     -ngl 99 \
     -c 4096 \
     -n 128 \
@@ -241,10 +227,12 @@ Flag cheat sheet:
 Reality check from another shell while it runs:
 
 ```bash
-nvidia-smi    # llama-cli should show non-zero GPU memory and util %
+nvidia-smi    # llama-cli should show ~16 GB GPU memory used + non-zero util %
 ```
 
-Expected: ~50–80 tok/s steady-state at batch=1 with Q4_K_M, all layers on GPU.
+Expected on a 32 GB V100 with FP16, all layers on GPU: **~30–50 tok/s** steady-state
+at batch=1. (FP16 is ~2× slower than Q4_K_M because each generated token reads ~2× the
+weight bytes — but it's the original-precision model.)
 
 If `nvidia-smi` shows zero GPU activity (or the model loads on CPU only), CUDA
 didn't link in — go back to Section 3.
@@ -297,7 +285,7 @@ cmake --build build --config Release -j $(nproc)
 | `llama-cli --list-devices` shows only CPU | CUDA didn't compile in — likely `-DGGML_CUDA=ON` was missing or `nvcc` wasn't found. Re-run Section 3. |
 | `error while loading shared libraries: libcudart.so.12` | `LD_LIBRARY_PATH` doesn't include CUDA's `lib64`. `export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH`. |
 | Slow generation (~5 tok/s) | Layers running on CPU. Pass `-ngl 99` and confirm `nvidia-smi` shows non-zero memory + utilization. |
-| OOM on 16 GB V100 with Q8_0 | Q8_0 is 8.5 GB; KV cache for 8K context is another ~2 GB. Switch to Q5_K_M / Q4_K_M, or lower `-c` to 2048. |
+| OOM loading FP16 GGUF on a 16 GB V100 | The full FP16 model is ~16 GB; KV cache for 4K context adds ~1 GB on top. A 16 GB V100 can't fit it. **Quantize** to a smaller GGUF: `~/llama3_on_v100/llama.cpp/build/bin/llama-quantize $WORKDIR/llama3_models/Meta-Llama-3-8B-Instruct-f16.gguf $WORKDIR/llama3_models/Meta-Llama-3-8B-Instruct-Q5_K_M.gguf Q5_K_M` (Q5_K_M ~5.7 GB) or `Q4_K_M` (~4.7 GB). Then run `llama-cli` with the quantized path. |
 | `gcc: error: unrecognized command-line option '-std=c++20'` | gcc too old for the C++ standard llama.cpp asks for. `module load gcc/11` if Modules are available, or `conda install -n llamacpp-v100 -c conda-forge gxx_linux-64=11 gcc_linux-64=11`. |
 | `convert_hf_to_gguf.py` import errors (`gguf`, `safetensors`, etc.) | `python -m pip install -r ~/llama3_on_v100/llama.cpp/requirements.txt`. |
 | `convert_hf_to_gguf.py: error: Model class ... is not supported` | llama.cpp commit too old for newer Llama-3 config fields. `git pull` in `~/llama3_on_v100/llama.cpp` and rebuild. |
@@ -315,8 +303,7 @@ $HOME (≤ 12 GB quota)
 ├── conda_envs/llamacpp-v100/             # ~1.5 GB after converter deps land
 ├── llama.cpp/                            # source + build/  (~2 GB after build)
 └── llama3_models/
-    ├── Meta-Llama-3-8B-Instruct-f16.gguf       # ~16 GB (optional, can delete after quantize)
-    └── Meta-Llama-3-8B-Instruct-Q4_K_M.gguf    # ~4.7 GB
+    └── Meta-Llama-3-8B-Instruct-f16.gguf       # ~16 GB (the original-precision model)
 ```
 
 ---
