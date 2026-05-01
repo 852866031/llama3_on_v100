@@ -7,6 +7,12 @@ GPUs, and runs a simple throughput benchmark.
 > 16 GB or 32 GB. The guide assumes the discslab home quota (~12 GB) and the
 > `/mnt/nobackup` scratch mount; if you're on a different host, adapt Section 1.
 
+> **TL;DR — reproducing a known-good environment:** if you just want to recreate the
+> exact env that's already been validated on this host, skip ahead and use
+> [`requirements_vllm.txt`](./requirements_vllm.txt) (see Section 9 below). The
+> step-by-step sections that follow exist to *build* that file — and to explain why
+> each version is pinned the way it is.
+
 ---
 
 ## 0. V100 Constraints (read first)
@@ -238,11 +244,53 @@ python -m pip install vllm==0.5.4
 This pulls a matching `xformers` wheel automatically. If pip complains about a torch
 version mismatch, recreate the env and reinstall torch first (Section 3), then vLLM.
 
-Smoke-check the import:
+### 4a. Install missing transitive deps and pin compatible versions
+
+vLLM 0.5.4 (July 2024) was built against `transformers` 4.x and does *not* understand
+`transformers` 5.x's auto-injected `rope_scaling={'rope_type': 'default', ...}` —
+loading any Llama-3 model will crash with an `AssertionError` deep inside `vllm.config`.
+You need to pin transformers to the 4.x line.
+
+In addition, `outlines` (vLLM's guided-decoding dep) imports several packages it
+doesn't declare. One of them, `pyairports`, is reachable from `outlines.types`.
+**The PyPI release of `pyairports` uses the deprecated `pkg_resources` API and is
+broken on modern setuptools — even with `setuptools<81` it tends to misbehave.**
+Install the maintained fork from GitHub instead, which uses `importlib.resources`:
+
+```bash
+# Pin transformers + the other small outlines deps:
+python -m pip install \
+    "transformers==4.44.2" \
+    "setuptools<81" \
+    pycountry interegular lark
+
+# Install pyairports from the maintained fork (NOT from PyPI):
+python -m pip install git+https://github.com/ozeliger/pyairports.git
+```
+
+Verify:
+
+```bash
+python -c "from pyairports.airports import AIRPORT_LIST; print('pyairports ok')"
+python -c "import transformers; print('transformers', transformers.__version__)"
+# expect: transformers 4.44.2
+python -c "
+from transformers import AutoConfig
+cfg = AutoConfig.from_pretrained('meta-llama/Meta-Llama-3-8B-Instruct')
+print('rope_scaling:', cfg.rope_scaling)
+# expect: rope_scaling: None  (NOT a dict with 'rope_type': 'default')
+"
+```
+
+### 4b. Smoke-check the import
 
 ```bash
 python -c "import vllm; print(vllm.__version__)"
+python -c "from vllm import LLM, SamplingParams; print('ok')"
 ```
+
+The second line is the real test — it forces the deep import chain that hits the
+`outlines` transitive deps. If it prints `ok`, you're good.
 
 ---
 
@@ -256,15 +304,36 @@ python -c "import vllm; print(vllm.__version__)"
 
 ```bash
 python -m pip install -U "huggingface_hub[cli]"
-huggingface-cli login    # paste the token
+```
+
+> **Two important notes for this server:**
+>
+> 1. **CLI renamed.** Recent `huggingface_hub` (≥0.34) ships the CLI as `hf`, not
+>    `huggingface-cli`. The old `huggingface-cli` binary still exists but only prints
+>    a deprecation warning pointing to `hf`. Use `hf ...` from now on.
+> 2. **PATH shadowing.** `/usr/local/bin/huggingface-cli` is an old system-wide install
+>    that shadows the env's CLI. Always invoke the env's binary by absolute path
+>    (`"$CONDA_PREFIX/bin/hf" ...`) or use the Python API.
+
+Login (use the env's CLI so the token saves under the right config dir):
+
+```bash
+"$CONDA_PREFIX/bin/hf" auth login    # paste the token
 ```
 
 Pre-download so the first vLLM run doesn't stall on a 16 GB pull. Because `HF_HOME`
-points to `/mnt/nobackup/jchen/`, the weights land there automatically:
+points to `/mnt/nobackup/jchen/`, the weights land there automatically. Two equivalent
+forms — pick whichever you prefer:
 
 ```bash
-huggingface-cli download meta-llama/Meta-Llama-3-8B-Instruct
-# verify it landed on /mnt/nobackup
+# Option 1: env's CLI via absolute path
+"$CONDA_PREFIX/bin/hf" download meta-llama/Meta-Llama-3-8B-Instruct
+
+# Option 2: Python API (no CLI involved, safest against PATH shadowing or renames)
+python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('meta-llama/Meta-Llama-3-8B-Instruct')"
+
+# Verify it landed on /mnt/nobackup
 du -sh /mnt/nobackup/jchen/hf_cache/hub/models--meta-llama--Meta-Llama-3-8B-Instruct
 ```
 
@@ -406,6 +475,59 @@ curl http://localhost:8000/v1/completions \
 
 ---
 
+## 9. Reproducible env via `requirements_vllm.txt`
+
+Once an env is working, freeze it so you (or anyone else on this host) can recreate it
+in one command instead of walking through Sections 3–4 again. A current freeze is
+checked into this repo as [`requirements_vllm.txt`](./requirements_vllm.txt).
+
+### 9a. Re-freeze after any package change
+
+```bash
+python -m pip freeze > /home/2020/jchen213/llama3_on_v100/requirements_vllm.txt
+```
+
+The freeze file is just the output of `pip freeze` with a comment header. It captures
+**every** installed package at exact versions, including the git-installed `pyairports`
+fork (pip preserves the exact commit hash as `pyairports @ git+https://...@<sha>`).
+
+### 9b. Reproduce the env from the freeze
+
+Skipping straight from Section 2 (env created) to a fully-installed vLLM:
+
+```bash
+# Inside an activated, /mnt/nobackup-located, Python-3.10 conda env:
+python -m pip install -r /home/2020/jchen213/llama3_on_v100/requirements_vllm.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu121
+```
+
+The `--extra-index-url` is required so pip can find:
+
+* the `+cu121` torch wheels, and
+* the `nvidia-*-cu12` CUDA runtime packages.
+
+Without it pip will fail to resolve those.
+
+### 9c. What the freeze captures vs. what the README says
+
+These are not always identical — pip's resolver may upgrade things during install:
+
+| Package | README per-step pin | What `requirements_vllm.txt` actually has |
+|---|---|---|
+| `torch` | `2.3.0` (Section 3) | **`2.4.0`** — vLLM 0.5.4's deps bumped it |
+| `torchvision` | `0.18.0` | `0.19.0` — paired with torch 2.4 |
+| `transformers` | `4.44.2` (Section 4a) | `4.44.2` (matches) |
+| `vllm` | `0.5.4` (Section 4) | `0.5.4` (matches) |
+| `pyairports` | `git+https://github.com/ozeliger/pyairports.git` | same, pinned to commit `f611ee5...` |
+| `setuptools` | `<81` (Section 4a) | whatever vllm pulled, still `<81` |
+
+**The freeze is authoritative.** If you ever see a discrepancy, trust the freeze — it
+reflects what actually loaded the model successfully. The README's per-step pins are
+the *minimum constraints* needed to avoid the failure modes documented in
+Troubleshooting; pip is free to pick higher compatible versions during resolution.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -417,9 +539,16 @@ curl http://localhost:8000/v1/completions \
 | CUDA graph capture failure / illegal memory access | Keep `enforce_eager=True`. |
 | 401 / gated repo | `huggingface-cli whoami` to confirm login; recheck license acceptance, or switch to `NousResearch/Meta-Llama-3-8B-Instruct`. |
 | `xformers` wheel mismatch on install | Recreate the env, install the exact torch version in Section 3 first, then `python -m pip install vllm==0.5.4`. |
+| `ModuleNotFoundError: No module named 'pyairports'` on `from vllm import LLM` | Install the maintained GitHub fork (the PyPI release is broken on modern setuptools): `python -m pip install git+https://github.com/ozeliger/pyairports.git`. |
+| `ModuleNotFoundError: No module named 'pycountry'` / `'interegular'` / `'lark'` on `from vllm import LLM` | vLLM 0.5.x pulls in `outlines` for guided decoding, but `outlines` has transitive deps it doesn't declare. `python -m pip install pycountry interegular lark`. |
+| `ModuleNotFoundError: No module named 'pkg_resources'` (raised from inside `pyairports`) — even with `pyairports` installed from PyPI and `setuptools<81` | The PyPI build of `pyairports` uses the legacy `pkg_resources` API and is unreliable. Replace it with the GitHub fork: `python -m pip uninstall -y pyairports && python -m pip install git+https://github.com/ozeliger/pyairports.git`. |
+| `AssertionError` in `vllm/config.py` `_get_and_verify_max_len` at `assert "factor" in rope_scaling` (when loading Llama-3) | `transformers` 5.x auto-injects `rope_scaling={'rope_type': 'default', ...}` even when the model's `config.json` has `rope_scaling: null`. vLLM 0.5.4 only recognizes `rope_type` ∈ `{su, longrope, llama3}` and asserts `factor` for everything else. Pin transformers: `python -m pip install "transformers==4.44.2"`. |
 | `Defaulting to user installation because normal site-packages is not writeable` (pip writes to `~/.local/lib/python3.8/`) | The shell is using system Python 3.8, not the env's Python 3.10 — `conda activate` updated only the prompt. Re-run Section 2b (`source /usr/local/pkgs/anaconda/etc/profile.d/conda.sh && conda activate vllm-v100`), then verify Section 2c. Always invoke pip as `python -m pip` to be safe. |
 | `pip install ...` says "Requirement already satisfied" but `python -c "import torch"` fails with `ModuleNotFoundError` | `pip` resolved to a stale `~/.local/bin/pip` shim targeting an old Python (e.g. 3.8) while `python` resolves to the env's 3.10 — they're out of sync. Use `python -m pip install ...` instead, or `rm -f ~/.local/bin/pip ~/.local/bin/pip3 ~/.local/bin/pip3.*` to remove the shims. Also clean any stale `~/.local/lib/python3.X/site-packages/torch` (was 1.2 GB on this server) — it's a dead duplicate now. |
 | Conda hook not sourced in VSCode terminal | VSCode's integrated terminal uses an `--init-file` that often skips `~/.bashrc`. Either `source /usr/local/pkgs/anaconda/etc/profile.d/conda.sh` at the start of each shell, or add `[ -f ~/.bashrc ] && source ~/.bashrc` to `~/.bash_profile`, or set the VSCode terminal profile to `bash -l`. |
+| `huggingface-cli: error: invalid choice: 'download'` | `/usr/local/bin/huggingface-cli` (system-wide, ancient) is shadowing the env's CLI in PATH. Use `"$CONDA_PREFIX/bin/hf" download ...` or the Python API (`python -c "from huggingface_hub import snapshot_download; snapshot_download('...')"`). |
+| `Warning: huggingface-cli is deprecated... Use hf instead.` | Recent `huggingface_hub` (≥0.34) renamed the CLI. Switch to `"$CONDA_PREFIX/bin/hf" auth login` and `"$CONDA_PREFIX/bin/hf" download ...`. The old binary still exists but is a no-op shim. |
+| `hf auth login` succeeds but `hf download` says you're not authenticated | Token went to a different config dir than the one the download command reads. Confirm with `"$CONDA_PREFIX/bin/hf" auth whoami`. If it says "not logged in," re-run `hf auth login` from the same shell, or set `HF_TOKEN=hf_xxx` directly in the environment. |
 | Disk fills up in `$HOME` after downloading the model | `HF_HOME` wasn't exported. `echo $HF_HOME` should print `/mnt/nobackup/jchen/hf_cache`. Re-run the activate.d snippet from Section 2c, then `rm -rf ~/.cache/huggingface` to reclaim space. |
 | `conda env list` shows env under `/home/...` despite `--prepend` | Check `cat ~/.condarc` directly — the prepend may have been a no-op if the line was already present. Edit `~/.condarc` by hand to ensure `/mnt/nobackup/jchen/conda_envs` is the first entry under `envs_dirs`. |
 
