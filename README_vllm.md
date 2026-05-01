@@ -130,29 +130,49 @@ With Section 1c done, this lands on `/mnt/nobackup` automatically:
 
 ```bash
 conda create -n vllm-v100 python=3.10 -y
-conda activate vllm-v100
 ```
 
 Python 3.10 is the safest choice for vLLM 0.5.x wheels.
 
-### 2b. Verify the env is on `/mnt/nobackup` (do not skip this)
+### 2b. Activate (the careful version — VSCode terminals need this)
+
+VSCode's integrated terminal often skips `~/.bashrc`, so `conda activate` will set the
+shell prompt but *not* update `PATH` or `CONDA_PREFIX`. Source the conda hook
+explicitly first:
 
 ```bash
-conda env list
-# expect:  vllm-v100  *  /mnt/nobackup/jchen/conda_envs/vllm-v100
-which python
-# expect:  /mnt/nobackup/jchen/conda_envs/vllm-v100/bin/python
-which pip
-# expect:  /mnt/nobackup/jchen/conda_envs/vllm-v100/bin/pip
-echo $CONDA_PREFIX
-# expect:  /mnt/nobackup/jchen/conda_envs/vllm-v100
+source /usr/local/pkgs/anaconda/etc/profile.d/conda.sh
+conda activate vllm-v100
 ```
 
-If `which python` starts with `/home/2020/...` or `/usr/...`, **stop**. Section 1c
-didn't take effect, and installing torch from here will exhaust your home quota.
-Re-run `conda config --show envs_dirs` and confirm `/mnt/nobackup/...` is the first entry.
+### 2c. Verify the env actually activated (do not skip — the prompt lies)
 
-### 2c. Persist `HF_HOME` for this env
+```bash
+echo $CONDA_PREFIX
+# expect:  /mnt/nobackup/jchen/conda_envs/vllm-v100
+which python
+# expect:  /mnt/nobackup/jchen/conda_envs/vllm-v100/bin/python
+python --version
+# expect:  Python 3.10.x
+python -m pip --version
+# expect:  pip ... from /mnt/nobackup/jchen/conda_envs/vllm-v100/lib/python3.10/.../pip
+```
+
+The prompt prefix `(/mnt/nobackup/jchen/conda_envs/vllm-v100)` is **not** sufficient
+proof of activation — `conda` updates the prompt cosmetically even when activation
+didn't take. Trust `$CONDA_PREFIX` and `which python`.
+
+If `which python` starts with `/home/2020/...` or `/usr/...`, **stop**. Either
+Section 1c didn't take effect, or the conda hook wasn't sourced (re-run 2b).
+Installing torch from here will exhaust your home quota.
+
+> **Why we use `python -m pip` everywhere from now on:** even after correct activation,
+> a stale `~/.local/bin/pip` shim from a prior `pip --user` install can shadow the env's
+> `pip` because `~/.local/bin` may sit earlier in `PATH`. `python -m pip` invokes pip
+> through *this* python, bypassing PATH entirely. If you'd rather fix it once and use
+> `pip` directly, run: `rm -f ~/.local/bin/pip ~/.local/bin/pip3 ~/.local/bin/pip3.*`
+
+### 2d. Persist `HF_HOME` for this env
 
 Drop a snippet into the env's `activate.d/` so `HF_HOME` is set automatically every time
 you `conda activate vllm-v100`:
@@ -175,13 +195,19 @@ echo $HF_HOME
 
 ## 3. Install PyTorch (CUDA 12.1 build)
 
-V100 supports CUDA 11.8 and 12.1. Use the cu121 wheel that vLLM 0.5.x is built against:
+V100 supports CUDA 11.8 and 12.1. Use the cu121 wheel that vLLM 0.5.x is built against.
+**Use `python -m pip`** (see Section 2c for why) so the install targets the env's
+site-packages, not `~/.local`:
 
 ```bash
-pip install --upgrade pip
-pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \
+python -m pip install --upgrade pip
+python -m pip install torch==2.3.0 torchvision==0.18.0 torchaudio==2.3.0 \
     --index-url https://download.pytorch.org/whl/cu121
 ```
+
+If pip says `Defaulting to user installation because normal site-packages is not
+writeable` — **abort**. That message means `python` is system Python 3.8, not the env.
+Go back to Section 2b and re-source the conda hook.
 
 This is the install step that previously blew out home quota. With Sections 1c–1d done,
 the wheels (~2 GB during download, ~2.5 GB extracted into site-packages) all land on
@@ -206,7 +232,7 @@ If `(7, 0)` does not print, stop — the rest of this guide assumes a Volta devi
 ## 4. Install vLLM
 
 ```bash
-pip install vllm==0.5.4
+python -m pip install vllm==0.5.4
 ```
 
 This pulls a matching `xformers` wheel automatically. If pip complains about a torch
@@ -229,7 +255,7 @@ python -c "import vllm; print(vllm.__version__)"
 3. Log in from the shell:
 
 ```bash
-pip install -U "huggingface_hub[cli]"
+python -m pip install -U "huggingface_hub[cli]"
 huggingface-cli login    # paste the token
 ```
 
@@ -387,10 +413,13 @@ curl http://localhost:8000/v1/completions \
 | `Disk quota exceeded` during `pip install torch` | `envs_dirs` not pointing at `/mnt/nobackup` (Section 1c) **or** pip cache not redirected (Section 1d). Run `which python` — if it's under `/home/...`, the env is in the wrong place. Remove with `conda env remove -n vllm-v100`, redo Section 1c, then Section 2. |
 | `bfloat16 is only supported on GPUs with compute capability >= 8.0` | Pass `dtype="float16"` (or `--dtype half`). |
 | `FlashAttention only supports Ampere GPUs or newer` | `export VLLM_ATTENTION_BACKEND=XFORMERS`. |
-| OOM on 16 GB V100 | Lower `max_model_len` (e.g. 2048), lower `gpu_memory_utilization` to 0.85, set `tensor_parallel_size=2`, or load an AWQ build (`pip install autoawq` and use a community `*-AWQ` repo). |
+| OOM on 16 GB V100 | Lower `max_model_len` (e.g. 2048), lower `gpu_memory_utilization` to 0.85, set `tensor_parallel_size=2`, or load an AWQ build (`python -m pip install autoawq` and use a community `*-AWQ` repo). |
 | CUDA graph capture failure / illegal memory access | Keep `enforce_eager=True`. |
 | 401 / gated repo | `huggingface-cli whoami` to confirm login; recheck license acceptance, or switch to `NousResearch/Meta-Llama-3-8B-Instruct`. |
-| `xformers` wheel mismatch on install | Recreate the env, install the exact torch version in Section 3 first, then `pip install vllm==0.5.4`. |
+| `xformers` wheel mismatch on install | Recreate the env, install the exact torch version in Section 3 first, then `python -m pip install vllm==0.5.4`. |
+| `Defaulting to user installation because normal site-packages is not writeable` (pip writes to `~/.local/lib/python3.8/`) | The shell is using system Python 3.8, not the env's Python 3.10 — `conda activate` updated only the prompt. Re-run Section 2b (`source /usr/local/pkgs/anaconda/etc/profile.d/conda.sh && conda activate vllm-v100`), then verify Section 2c. Always invoke pip as `python -m pip` to be safe. |
+| `pip install ...` says "Requirement already satisfied" but `python -c "import torch"` fails with `ModuleNotFoundError` | `pip` resolved to a stale `~/.local/bin/pip` shim targeting an old Python (e.g. 3.8) while `python` resolves to the env's 3.10 — they're out of sync. Use `python -m pip install ...` instead, or `rm -f ~/.local/bin/pip ~/.local/bin/pip3 ~/.local/bin/pip3.*` to remove the shims. Also clean any stale `~/.local/lib/python3.X/site-packages/torch` (was 1.2 GB on this server) — it's a dead duplicate now. |
+| Conda hook not sourced in VSCode terminal | VSCode's integrated terminal uses an `--init-file` that often skips `~/.bashrc`. Either `source /usr/local/pkgs/anaconda/etc/profile.d/conda.sh` at the start of each shell, or add `[ -f ~/.bashrc ] && source ~/.bashrc` to `~/.bash_profile`, or set the VSCode terminal profile to `bash -l`. |
 | Disk fills up in `$HOME` after downloading the model | `HF_HOME` wasn't exported. `echo $HF_HOME` should print `/mnt/nobackup/jchen/hf_cache`. Re-run the activate.d snippet from Section 2c, then `rm -rf ~/.cache/huggingface` to reclaim space. |
 | `conda env list` shows env under `/home/...` despite `--prepend` | Check `cat ~/.condarc` directly — the prepend may have been a no-op if the line was already present. Edit `~/.condarc` by hand to ensure `/mnt/nobackup/jchen/conda_envs` is the first entry under `envs_dirs`. |
 
