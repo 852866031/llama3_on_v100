@@ -9,7 +9,7 @@ GPUs, and runs a simple throughput benchmark.
 
 > **TL;DR — reproducing a known-good environment:** if you just want to recreate the
 > exact env that's already been validated on this host, skip ahead and use
-> [`requirements_vllm.txt`](./requirements_vllm.txt) (see Section 9 below). The
+> [`requirements_vllm.txt`](./requirements_vllm.txt) (see Section 7 below). The
 > step-by-step sections that follow exist to *build* that file — and to explain why
 > each version is pinned the way it is.
 
@@ -386,102 +386,13 @@ the env var didn't take effect — re-export it in the same shell.
 
 ---
 
-## 7. Throughput Benchmark
-
-This batches 64 prompts of 128 output tokens and reports tokens/sec. It's
-intentionally minimal so it works without cloning the vLLM repo.
-
-Create `vllm_bench.py`:
-
-```python
-import time
-from vllm import LLM, SamplingParams
-
-MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
-N_PROMPTS = 64
-MAX_TOKENS = 128
-
-llm = LLM(
-    model=MODEL,
-    dtype="float16",
-    gpu_memory_utilization=0.90,
-    max_model_len=2048,
-    enforce_eager=True,
-)
-
-prompts = ["Write a short story about a robot learning to paint."] * N_PROMPTS
-sampling = SamplingParams(temperature=0.0, max_tokens=MAX_TOKENS, ignore_eos=True)
-
-# Warm up (JITs kernels, fills KV cache pool)
-llm.generate(prompts[:4], sampling)
-
-t0 = time.time()
-outputs = llm.generate(prompts, sampling)
-elapsed = time.time() - t0
-
-total_out_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
-print(f"Model:       {MODEL}")
-print(f"Requests:    {N_PROMPTS}")
-print(f"Out tokens:  {total_out_tokens}")
-print(f"Elapsed:     {elapsed:.2f} s")
-print(f"Throughput:  {total_out_tokens / elapsed:.2f} output tok/s")
-print(f"Req/s:       {N_PROMPTS / elapsed:.2f}")
-```
-
-Run:
-
-```bash
-VLLM_ATTENTION_BACKEND=XFORMERS python vllm_bench.py
-```
-
-Rough expectations on a single 32 GB V100 (FP16, eager, xFormers):
-
-| Metric              | Ballpark           |
-|---------------------|--------------------|
-| Output throughput   | ~600–1100 tok/s    |
-| Per-request latency | dominated by batch |
-
-Numbers vary with prompt length, batch size, and `max_model_len`. Treat the script
-above as a starting point — bump `N_PROMPTS` to saturate the scheduler.
-
----
-
-## 8. (Optional) Run vLLM as an OpenAI-compatible Server
-
-For an HTTP endpoint instead of offline batch:
-
-```bash
-VLLM_ATTENTION_BACKEND=XFORMERS \
-python -m vllm.entrypoints.openai.api_server \
-    --model meta-llama/Meta-Llama-3-8B-Instruct \
-    --dtype float16 \
-    --max-model-len 4096 \
-    --gpu-memory-utilization 0.90 \
-    --enforce-eager \
-    --port 8000
-```
-
-Test with curl:
-
-```bash
-curl http://localhost:8000/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "meta-llama/Meta-Llama-3-8B-Instruct",
-    "prompt": "Hello,",
-    "max_tokens": 32
-  }'
-```
-
----
-
-## 9. Reproducible env via `requirements_vllm.txt`
+## 7. Reproducible env via `requirements_vllm.txt`
 
 Once an env is working, freeze it so you (or anyone else on this host) can recreate it
 in one command instead of walking through Sections 3–4 again. A current freeze is
 checked into this repo as [`requirements_vllm.txt`](./requirements_vllm.txt).
 
-### 9a. Re-freeze after any package change
+### 7a. Re-freeze after any package change
 
 ```bash
 python -m pip freeze > /home/2020/jchen213/llama3_on_v100/requirements_vllm.txt
@@ -491,7 +402,7 @@ The freeze file is just the output of `pip freeze` with a comment header. It cap
 **every** installed package at exact versions, including the git-installed `pyairports`
 fork (pip preserves the exact commit hash as `pyairports @ git+https://...@<sha>`).
 
-### 9b. Reproduce the env from the freeze
+### 7b. Reproduce the env from the freeze
 
 Skipping straight from Section 2 (env created) to a fully-installed vLLM:
 
@@ -508,7 +419,7 @@ The `--extra-index-url` is required so pip can find:
 
 Without it pip will fail to resolve those.
 
-### 9c. What the freeze captures vs. what the README says
+### 7c. What the freeze captures vs. what the README says
 
 These are not always identical — pip's resolver may upgrade things during install:
 
